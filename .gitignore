@@ -1,0 +1,6 @@
+camera-modes
+camera-names.json
+.env*
+.DS_Store
+node_modules/
+*.log

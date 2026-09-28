@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>USB Camera Lab</title>
+  <style>
+    :root { color-scheme: dark; font: 15px/1.45 system-ui, -apple-system, sans-serif; background: #0e1218; color: #e9eef5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px; }
+    main { max-width: 1500px; margin: auto; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    h1 { font-size: 28px; letter-spacing: -.04em; margin: 0 0 4px; }
+    h2 { font-size: 19px; margin: 0; }
+    p { margin: 0; color: #9ba9b9; }
+    .actions, .card-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+    button { background: #232d38; color: #edf4fa; border: 1px solid #40505d; border-radius: 9px; padding: 9px 14px; font: inherit; cursor: pointer; }
+    button:hover { background: #31404d; }
+    button[aria-pressed="true"] { background: #315c51; border-color: #3dd4ab; color: #b5ffe7; }
+    button.primary { background: #3dd4ab; color: #07261e; border-color: #3dd4ab; font-weight: 700; }
+    button.primary:hover { background: #7de9ca; }
+    button:disabled { opacity: .5; cursor: wait; }
+    #status { min-height: 26px; margin-bottom: 10px; }
+    .error { color: #ff9e96; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 20px; }
+    article { overflow: hidden; background: #171e27; border: 1px solid #2d3945; border-radius: 16px; }
+    .card-head, .card-body { padding: 16px 18px; }
+    .card-head { display: flex; gap: 10px; justify-content: space-between; align-items: start; }
+    .badge { border-radius: 20px; padding: 4px 9px; background: #354251; color: #b9c7d5; font-size: 12px; white-space: nowrap; }
+    .badge.live { background: #164536; color: #8df1c8; }
+    .preview { position: relative; aspect-ratio: 16/10; background: #080b10; display: grid; place-items: center; overflow: hidden; }
+    video { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .preview video { transform: scale(var(--mirror-x, 1), var(--flip-y, 1)); }
+    .preview.mirror-x { --mirror-x: -1; }
+    .preview.flip-y { --flip-y: -1; }
+    .placeholder { position: absolute; color: #718195; text-align: center; padding: 12px; pointer-events: none; }
+    .grid { position: absolute; inset: 0; pointer-events: none; display: none; background: linear-gradient(90deg, transparent 33.2%, #ffffff99 33.3%, transparent 33.4%, transparent 66.5%, #ffffff99 66.6%, transparent 66.7%), linear-gradient(transparent 33.2%, #ffffff99 33.3%, transparent 33.4%, transparent 66.5%, #ffffff99 66.6%, transparent 66.7%); }
+    .preview.grid-on .grid { display: block; }
+    .card-body { display: grid; gap: 14px; }
+    .stats { display: flex; flex-wrap: wrap; gap: 8px; }
+    .stat { background: #222d38; padding: 5px 9px; border-radius: 7px; font-variant-numeric: tabular-nums; }
+    .signature { color: #aebdcb; font-size: 13px; overflow-wrap: anywhere; }
+    .signature strong { color: #d9e4ef; }
+    .name-row { display: flex; gap: 8px; }
+    input, select { min-width: 0; flex: 1; border-radius: 8px; background: #0e151c; border: 1px solid #465363; color: #fff; padding: 9px 11px; font: inherit; }
+    .mode-row { display: flex; align-items: center; gap: 9px; color: #aebdcb; }
+    .note { font-size: 12px; color: #8795a5; }
+    footer { color: #8190a0; font-size: 13px; margin-top: 22px; }
+    @media (max-width: 700px) { body { padding: 15px; } header { display: block; } .actions { margin-top: 16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>USB Camera Lab</h1><p>Live, uncropped previews for comparing field of view and motion.</p></div>
+    <div class="actions">
+      <button id="refresh">Rescan USB</button>
+      <button id="stop-all">Stop all</button>
+      <button class="primary" id="start-all">Start previews</button>
+    </div>
+  </header>
+  <div id="status" role="status"></div>
+  <div id="cards" class="cards"></div>
+  <footer>Names are saved on this Mac. Preview requests the highest frame rate the camera advertises, then the largest resolution at that rate. The live FPS number measures frames received by the browser.</footer>
+</main>
+<script type="module">
+const cards = document.querySelector('#cards');
+const status = document.querySelector('#status');
+const active = new Map();
+let catalog = [];
+let names = {};
+let browserDevices = [];
+let refreshing = false;
+let autoPreview = false;
+
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const showStatus = (message, error = false) => { status.textContent = message; status.className = error ? 'error' : ''; };
+const cardId = index => `camera-${index}`;
+const card = index => document.getElementById(cardId(index));
+const orientationKey = signature => `camera-orientation:${signature}`;
+
+function toggleOrientation(index, axis) {
+  const camera = catalog[index];
+  const el = card(index);
+  const preview = el.querySelector('.preview');
+  const className = axis === 'horizontal' ? 'mirror-x' : 'flip-y';
+  const button = el.querySelector(axis === 'horizontal' ? '.mirror-button' : '.flip-button');
+  const enabled = preview.classList.toggle(className);
+  button.setAttribute('aria-pressed', String(enabled));
+  localStorage.setItem(orientationKey(camera.signature), JSON.stringify({
+    horizontal: preview.classList.contains('mirror-x'),
+    vertical: preview.classList.contains('flip-y')
+  }));
+}
+
+async function loadBrowserDevices() {
+  browserDevices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+}
+
+function matchDevices() {
+  const used = new Set();
+  for (const camera of catalog) {
+    const exact = browserDevices.filter(d => !used.has(d.deviceId) &&
+      (d.label === camera.name || d.label.startsWith(`${camera.name} (`)));
+    const fuzzy = browserDevices.filter(d => !used.has(d.deviceId) && d.label.toLowerCase().includes(camera.name.toLowerCase()));
+    const matches = exact.length ? exact : fuzzy;
+    camera.browserDevice = matches[0] || null;
+    camera.ambiguous = matches.length > 1;
+    if (camera.browserDevice) used.add(camera.browserDevice.deviceId);
+  }
+}
+
+function render() {
+  cards.innerHTML = '';
+  catalog.forEach((camera, index) => {
+    const el = document.createElement('article');
+    el.id = cardId(index);
+    const max = camera.modes[0];
+    const usb = camera.usb || {};
+    const extra = camera.identity === 'port'
+      ? 'No serial number: this name follows this USB port. If you swap in an identical unit, rename it or use a different port.'
+      : camera.identity === 'serial' ? 'This name follows the camera serial number.' : 'System device identity.';
+    let orientation = {};
+    try { orientation = JSON.parse(localStorage.getItem(orientationKey(camera.signature))) || {}; } catch {}
+    el.innerHTML = `
+      <div class="card-head"><div><h2>${escapeHtml(names[camera.signature] || camera.name)}</h2><p>${escapeHtml(camera.name)}</p></div><span class="badge">Ready</span></div>
+      <div class="preview${orientation.horizontal ? ' mirror-x' : ''}${orientation.vertical ? ' flip-y' : ''}"><video autoplay playsinline muted></video><div class="placeholder">Press Start to preview</div><div class="grid"></div></div>
+      <div class="card-body">
+        <div class="stats"><span class="stat mode">Advertised: ${max ? `${max.width}×${max.height} at ${Math.round(max.maxFps)} FPS` : 'unknown'}</span><span class="stat actual">Actual: —</span><span class="stat measured">Live: —</span></div>
+        <div class="signature"><strong>Signature</strong> ${escapeHtml(usb.vendorId ? `${usb.vendorId}:${usb.productId}` : camera.uniqueId)}${usb.serial ? ` · serial ${escapeHtml(usb.serial)}` : usb.location ? ` · port ${escapeHtml(usb.location)}` : ''} ${usb.manufacturer ? `· ${escapeHtml(usb.manufacturer)}` : ''}</div>
+        <label class="mode-row">Capture mode <select class="mode-select"><option value="auto">Auto: fastest, then largest</option>${camera.modes.map((mode, modeIndex) => `<option value="${modeIndex}">${mode.width}×${mode.height} · ${Math.round(mode.maxFps)} FPS</option>`).join('')}</select></label>
+        <div class="name-row"><input aria-label="Name for ${escapeHtml(camera.name)}" placeholder="Give this camera a name" value="${escapeHtml(names[camera.signature] || '')}"><button class="save">Save name</button></div>
+        <div class="card-actions"><button class="start primary">Start</button><button class="stop">Stop</button><button class="mirror-button" aria-pressed="${Boolean(orientation.horizontal)}">Mirror horizontally</button><button class="flip-button" aria-pressed="${Boolean(orientation.vertical)}">Flip vertically</button><button class="grid-button">Grid</button><button class="full">Fullscreen</button></div>
+        <div class="note">${escapeHtml(extra)}${camera.ambiguous ? ' Multiple devices share this browser label; verify which view belongs to which.' : ''}</div>
+      </div>`;
+    cards.append(el);
+    el.querySelector('.save').onclick = () => saveName(index);
+    el.querySelector('input').onkeydown = event => { if (event.key === 'Enter') saveName(index); };
+    el.querySelector('.start').onclick = () => startCamera(index);
+    el.querySelector('.stop').onclick = () => stopCamera(index);
+    el.querySelector('.mirror-button').onclick = () => toggleOrientation(index, 'horizontal');
+    el.querySelector('.flip-button').onclick = () => toggleOrientation(index, 'vertical');
+    el.querySelector('.grid-button').onclick = () => el.querySelector('.preview').classList.toggle('grid-on');
+    el.querySelector('.full').onclick = () => el.querySelector('.preview').requestFullscreen();
+  });
+}
+
+async function saveName(index) {
+  const camera = catalog[index];
+  const name = card(index).querySelector('input').value.trim();
+  try {
+    const response = await fetch('/api/names', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({signature:camera.signature, name}) });
+    if (!response.ok) throw new Error((await response.json()).error);
+    names = await response.json();
+    card(index).querySelector('h2').textContent = name || camera.name;
+    showStatus(`Saved name for ${camera.name}.`);
+  } catch (error) { showStatus(`Could not save name: ${error.message}`, true); }
+}
+
+function stopCamera(index) {
+  const state = active.get(index);
+  if (state) {
+    state.stopped = true;
+    state.stream.getTracks().forEach(track => track.stop());
+    active.delete(index);
+  }
+  const el = card(index);
+  if (!el) return;
+  el.querySelector('video').srcObject = null;
+  el.querySelector('.placeholder').hidden = false;
+  el.querySelector('.badge').textContent = 'Ready';
+  el.querySelector('.badge').classList.remove('live');
+  el.querySelector('.actual').textContent = 'Actual: —';
+  el.querySelector('.measured').textContent = 'Live: —';
+}
+
+function measureFrames(video, index, state) {
+  if (!('requestVideoFrameCallback' in video)) {
+    card(index).querySelector('.measured').textContent = 'Live FPS: unavailable';
+    return;
+  }
+  const times = [];
+  const tick = now => {
+    if (state.stopped || active.get(index) !== state) return;
+    times.push(now);
+    while (times.length && times[0] < now - 3000) times.shift();
+    if (times.length > 2) {
+      const fps = (times.length - 1) * 1000 / (times.at(-1) - times[0]);
+      card(index).querySelector('.measured').textContent = `Live: ${fps.toFixed(1)} FPS`;
+    }
+    video.requestVideoFrameCallback(tick);
+  };
+  video.requestVideoFrameCallback(tick);
+}
+
+async function ensurePermission() {
+  await loadBrowserDevices();
+  if (browserDevices.some(d => d.label)) return;
+  const stream = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+  stream.getTracks().forEach(track => track.stop());
+  await loadBrowserDevices();
+  matchDevices();
+}
+
+async function startCamera(index) {
+  const camera = catalog[index];
+  const el = card(index);
+  if (!camera || !el) return;
+  const button = el.querySelector('.start');
+  button.disabled = true;
+  stopCamera(index);
+  el.querySelector('.badge').textContent = 'Starting';
+  try {
+    await ensurePermission();
+    if (!camera.browserDevice) throw new Error(`Browser cannot find ${camera.name}. Check camera permission and rescan.`);
+    let stream, selected;
+    const selectedMode = el.querySelector('.mode-select').value;
+    const modes = selectedMode === 'auto'
+      ? (camera.modes.length ? camera.modes : [{width:640,height:480,maxFps:30}])
+      : [camera.modes[Number(selectedMode)]];
+    for (const mode of modes) {
+      try {
+        const candidate = await navigator.mediaDevices.getUserMedia({audio:false, video:{
+          deviceId:{exact:camera.browserDevice.deviceId},
+          width:{exact:mode.width}, height:{exact:mode.height},
+          frameRate:{ideal:Math.round(mode.maxFps * 100) / 100, min:Math.max(1, mode.maxFps - 0.5)}
+        }});
+        const fps = candidate.getVideoTracks()[0].getSettings().frameRate || 0;
+        if (fps && fps < mode.maxFps - 0.5) { candidate.getTracks().forEach(t => t.stop()); continue; }
+        stream = candidate; selected = mode; break;
+      } catch (error) {
+        if (error.name === 'NotAllowedError' || error.name === 'SecurityError') throw error;
+      }
+    }
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({audio:false, video:{deviceId:{exact:camera.browserDevice.deviceId}, frameRate:{ideal:camera.modes[0]?.maxFps || 30}}});
+    }
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    const state = {stream, stopped:false};
+    active.set(index, state);
+    const video = el.querySelector('video');
+    video.srcObject = stream;
+    await video.play();
+    el.querySelector('.placeholder').hidden = true;
+    el.querySelector('.badge').textContent = 'Live';
+    el.querySelector('.badge').classList.add('live');
+    el.querySelector('.actual').textContent = `Actual: ${settings.width || video.videoWidth}×${settings.height || video.videoHeight} at ${settings.frameRate ? settings.frameRate.toFixed(1) : '?'} FPS`;
+    measureFrames(video, index, state);
+    track.onended = () => { if (active.get(index) === state) stopCamera(index); };
+    showStatus(`${camera.name} is live${selected ? ` at its ${Math.round(selected.maxFps)} FPS advertised mode` : ''}.`);
+  } catch (error) {
+    stopCamera(index);
+    el.querySelector('.badge').textContent = 'Error';
+    el.querySelector('.placeholder').textContent = error.message;
+    showStatus(`${camera.name}: ${error.message}`, true);
+  } finally { button.disabled = false; }
+}
+
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  showStatus('Scanning connected cameras…');
+  try {
+    const [cameraResponse, namesResponse] = await Promise.all([fetch('/api/cameras'), fetch('/api/names')]);
+    if (!cameraResponse.ok || !namesResponse.ok) throw new Error('Camera service did not respond.');
+    const scan = await cameraResponse.json();
+    names = await namesResponse.json();
+    for (const index of active.keys()) stopCamera(index);
+    catalog = scan.cameras.filter(c => c.isUsb);
+    await loadBrowserDevices();
+    matchDevices();
+    render();
+    showStatus(`${catalog.length} USB camera${catalog.length === 1 ? '' : 's'} connected.${browserDevices.some(d => d.label) ? '' : ' Press Start previews to grant camera access.'}`);
+    if (autoPreview) for (let index = 0; index < catalog.length; index++) await startCamera(index);
+  } catch (error) { showStatus(`Scan failed: ${error.message}`, true); }
+  refreshing = false;
+}
+
+document.querySelector('#refresh').onclick = refresh;
+document.querySelector('#stop-all').onclick = () => { autoPreview = false; for (const index of active.keys()) stopCamera(index); showStatus('All previews stopped.'); };
+document.querySelector('#start-all').onclick = async event => {
+  const button = event.currentTarget;
+  autoPreview = true;
+  button.disabled = true;
+  for (let index = 0; index < catalog.length; index++) await startCamera(index);
+  button.disabled = false;
+};
+navigator.mediaDevices?.addEventListener('devicechange', () => { setTimeout(refresh, 700); });
+refresh();
+</script>
+</body>
+</html>
